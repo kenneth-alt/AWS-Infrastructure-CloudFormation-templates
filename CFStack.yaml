@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  #prompt user to select a VPC
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select an existing VPC
+
+  AMIId:
+    Type: AWS::EC2::Image::Id
+    Description: Enter the ID of the Ubuntu AMI from this region to use for the EC2 instance
+  
+  #prompt user to select an existing Key Pai
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Select an existing EC2 Key Pair
+  
+  #prompt user to select an existing security group (should be within the same vpc)
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Select an existing Security Group
+
+  #prompt user to select a subnet within same vpc
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select an existing Subnet within the chosen VPC
+  
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the second subnet for the load balancer
+
+  #prompt user to insert instance type
+  InstanceType:
+    Type: String
+    Description: Choose the instance type for the EC2 instance
+
+  #prompt user to insert the storage size needed (default 8GB)
+  StorageSize:
+    Type: Number
+    Description: Enter the storage size (in GB) for the EC2 instance
+    Default: 8
+
+  #prompt user to insert a name for cloudwatch group
+  CloudWatchLogsGroupName:
+    Type: String
+    Description: Enter a name for the CloudWatch Logs group
+
+Resources:
+  #creates a cloudWatch group
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref CloudWatchLogsGroupName
+
+  #creates a CloudWatch stream to gather logs from the ec2
+  CloudWatchLogsStream:
+    Type: AWS::Logs::LogStream
+    DependsOn: CloudWatchLogsGroup
+    Properties:
+      LogGroupName: !Ref CloudWatchLogsGroupName
+
+  #creates an IAM Role for lamda to start/stop instance, also a full access for cloudwatch to gather logs
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+
+  #creates a role for the lifecycle manager
+  DLMExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: DLMExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - dlm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DLMPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dlm:CreateLifecyclePolicy
+                  - dlm:UpdateLifecyclePolicy
+                  - dlm:DeleteLifecyclePolicy
+                  - dlm:GetLifecyclePolicies
+                  - dlm:CreateSnapshot
+                  - dlm:DeleteSnapshot
+                  - dlm:GetLifecyclePolicy
+                  - dlm:GetLifecyclePolicyPreview
+                  - dlm:GetLifecyclePolicyPreview
+                  - dlm:GetLifecyclePolicyPreview
+                Resource: "*"
+
+  #creates a lifecycle to take daily snapshots
+  BasicLifecyclePolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      Description: Lifecycle Policy
+      ExecutionRoleArn: !GetAtt DLMExecutionRole.Arn
+      State: ENABLED
+      PolicyDetails:
+        ResourceTypes:
+        - VOLUME
+        TargetTags:
+        - Key: costcenter
+          Value: '115'
+        Schedules:
+        - Name: Daily Snapshots
+          TagsToAdd:
+          - Key: type
+            Value: DailySnapshot
+          CreateRule:
+            Interval: 24
+            IntervalUnit: HOURS
+            Times:
+            - '00:00'
+          RetainRule:
+            Count: 1
+          CopyTags: true
+          CrossRegionCopyRules:
+          - Encrypted: false
+            Target: us-east-1
+
+  #creates a laumche template that launches the new instance (in case of instance failure)
+  myLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateName: myRecoverTemplate
+      LaunchTemplateData: 
+        BlockDeviceMappings: 
+          - Ebs:
+              VolumeSize: !Ref StorageSize
+              VolumeType: gp2
+              DeleteOnTermination: true
+              Encrypted: true
+            DeviceName: /dev/xvdcz
+        CreditSpecification:
+          CpuCredits: Unlimited
+        Monitoring:
+          Enabled: true
+        ImageId: !Ref AMIId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        TagSpecifications:
+        - ResourceType: volume
+          Tags:
+            - Key: costcenter
+              Value: '115'
+        UserData: !Base64 |
+          #!/bin/bash
+          sudo apt update && sudo apt upgrade -y
+          sudo timedatectl set-timezone America/New_York
+          sudo apt install unattended-upgrades -y
+
+          # Configure unattended-upgrades
+          sudo dpkg-reconfigure --priority=low unattended-upgrades
+          sudo sed -i 's|//\s*\(o[=\s]Ubuntu,\)|\1|' /etc/apt/apt.conf.d/50unattended-upgrades
+          sudo sed -i 's|//\s*"\${distro_id}:\${distro_codename}-updates";|"\${distro_id}:\${distro_codename}-updates";|' /etc/apt/apt.conf.d/50unattended-upgrades
+          sudo sed -i 's|//\s*Unattended-Upgrade::Automatic-Reboot "\${distro_code_name}";|Unattended-Upgrade::Automatic-Reboot "true";|' /etc/apt/apt.conf.d/50unattended-upgrades
+
+          sudo systemctl enable unattended-upgrades
+
+          # Continue with other installation and configuration steps
+          sudo apt install apache2 -y
+          sudo ufw allow 'Apache Full'
+          sudo ufw allow 'OpenSSH'
+          sudo ufw enable
+          sudo systemctl enable apache2
+          sudo apt install mysql-server -y
+          sudo systemctl enable mysql
+          sudo apt install php libapache2-mod-php php7.4-mysql php7.4-common php7.4-mysql php7.4-xml php7.4-xmlrpc php7.4-curl php7.4-gd php7.4-imagick php7.4-cli php7.4-dev php7.4-imap php7.4-mbstring php7.4-opcache php7.4-soap php7.4-zip php7.4-intl -y
+          sudo apt install wget unzip php-bz2 php-json -y
+
+          # Remove the existing index.html file
+          sudo rm /var/www/html/index.html
+
+          # Create the new index.html file
+          sudo echo "
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>Welcome to redbear IT services!</title>
+            <style>
+              html { color-scheme: light dark; }
+              body { width: 35em; margin: 0 auto;
+                font-family: Tahoma, Verdana, Arial, sans-serif; }
+            </style>
+          </head>
+          <body>
+            <h1>Welcome to redbear IT services</h1>
+            <p>Red bear focus on ensuring quality IT services and security.</p>
+            <p>You can learn more about our services on our website <a href='http://redbearit.com.au'>http://redbearit.com.au</a>.</p>
+            <p><em>Thank you for visiting the redbear IT referral page.</em></p>
+          </body>
+          </html>
+          " > /var/www/html/index.html
+
+          # Create the cloudwatchlogs.config file
+          sudo echo "
+          [general]
+          state_file = /var/awslogs/state/agent-state
+
+          [/var/log/syslog]
+          file = /var/log/syslog
+          log_group_name = /var/log/syslog
+          log_stream_name = {instance_id}/var/log/syslog
+          datetime_format = %b %d %H:%M:%S
+          " > /tmp/cloudwatchlogs.config
+
+          # Configure CloudWatch Logs agent
+          sudo apt-get install -y awscli
+          sudo curl https://s3.amazonaws.com/aws-cloudwatch/downloads/latest/awslogs-agent-setup.py -O
+          sudo chmod +x ./awslogs-agent-setup.py
+          sudo ./awslogs-agent-setup.py -n -r ${AWS::Region} -c /tmp/cloudwatchlogs.config
+
+  #creates a target group 
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: MyTargetGroup
+      VpcId: !Ref VpcId
+      Port: 80
+      Protocol: HTTP
+  
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: MyLoadBalancer
+      Subnets:
+        - !Ref SubnetId
+        - !Ref SubnetId2
+      SecurityGroups:
+        - !Ref SecurityGroupId
+      Type: application
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+      Tags:
+        - Key: costcenter
+          Value: '115'
+
+  #creates a listener for load balancer to know which instance to route trafic to        
+  MyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  #creates an autoscaling that check everytime if there is an ec2 failure then if so it creates a new instance from the launche template
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: myAutoScalingGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref myLaunchTemplate
+        Version: !GetAtt myLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref SubnetId
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: costcenter
+          Value: '115'
+          PropagateAtLaunch: 'true'
+    DependsOn:
+      - myLaunchTemplate
+      - TargetGroup
+
+  #creates a Lambda function that stop instance if condition is true (if time betwen 7PM and 7AM), else it start the instance
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EC2InstanceScheduler
+      Handler: index.handler
+      Runtime: python3.8
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TargetGroupARN: !Ref TargetGroup
+          AutoScalingGroupName: !Ref AutoScalingGroup
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import os
+
+          elbv2 = boto3.client('elbv2')
+          ec2 = boto3.client('ec2')
+          autoscaling = boto3.client('autoscaling')
+
+          def get_target_group_instances(target_group_arn):
+              response = elbv2.describe_target_health(TargetGroupArn=target_group_arn)
+              instances = [instance['Target']['Id'] for instance in response['TargetHealthDescriptions']]
+              return instances
+
+          def handler(event, context):
+              target_group_arn = os.environ['TargetGroupARN']
+              auto_scaling_group_name = os.environ['AutoScalingGroupName']
+              instances = get_target_group_instances(target_group_arn)
+              current_time = datetime.datetime.now().strftime('%I:%M:%S %p')  # Example: 10:41:00 PM
+              current_time_obj = datetime.datetime.strptime(current_time, '%I:%M:%S %p')
+
+              start_time_str1 = '07:00:00 PM'
+              end_time_str1 = '11:59:00 PM'
+              start_time_str2 = '12:00:00 AM'
+              end_time_str2 = '07:00:00 AM'
+              start_time_obj1 = datetime.datetime.strptime(start_time_str1, '%I:%M:%S %p')
+              end_time_obj1 = datetime.datetime.strptime(end_time_str1, '%I:%M:%S %p')
+              start_time_obj2 = datetime.datetime.strptime(start_time_str2, '%I:%M:%S %p')
+              end_time_obj2 = datetime.datetime.strptime(end_time_str2, '%I:%M:%S %p')
+
+              if start_time_obj1 <= current_time_obj < end_time_obj1 or start_time_obj2 <= current_time_obj < end_time_obj2:
+                  response = autoscaling.suspend_processes(AutoScalingGroupName=auto_scaling_group_name)
+                  print(response)
+                  response = ec2.stop_instances(InstanceIds=instances)
+                  print(response)
+              else:
+                  response = autoscaling.resume_processes(AutoScalingGroupName=auto_scaling_group_name)
+                  print(response)
+                  response = ec2.start_instances(InstanceIds=instances)
+                  print(response)
+    DependsOn:
+      - AutoScalingGroup
+  
+  #creates a rule that triggers the lambda function in 7PM and 7AM
+  EC2InstanceSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: cron(0 19,7 * * ? *)  # Schedule for 7 PM and 7 AM (UTC time)
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: EC2InstanceScheduler
+
+#the output of the template (Elastic IP, Instance ID...)
+Outputs:
+  KeyPairName:
+    Description: The name of the EC2 Key Pair
+    Value: !Ref KeyPairName
+  SecurityGroupId:
+    Description: The ID of the Security Group
+    Value: !Ref SecurityGroupId
+  SubnetId:
+    Description: The ID of the Subnet
+    Value: !Ref SubnetId
+  CloudWatchLogsGroupName:
+    Description: The name of the CloudWatch Logs group
+    Value: !Ref CloudWatchLogsGroupName
